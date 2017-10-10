@@ -1,12 +1,13 @@
 extern crate hyper;
 extern crate futures;
 extern crate mime;
+extern crate flate2;
 
 use futures::future::{self, FutureResult};
 use hyper::{Request, Response, Method, StatusCode};
 use hyper::server::Http;
 use hyper::server::Service;
-use hyper::header::{ContentType, ContentLength};
+use hyper::header::{ContentType, ContentLength, ContentEncoding, Encoding, AcceptEncoding};
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ mod error;
 struct ServeStatic(PathBuf);
 
 impl ServeStatic {
-    fn read_and_respond(&self, path: &Path) -> Result<Response, ::hyper::Error> {
+    fn read_and_respond(&self, path: &Path, gzip: bool) -> Result<Response, ::hyper::Error> {
         let mut canonical = self.canonicalize(path);
         if canonical.is_dir() {
             canonical.push("index.html");
@@ -29,7 +30,7 @@ impl ServeStatic {
         if canonical.extension().is_none() {
             canonical.set_extension("html");
         }
-        let contents = read_file(&canonical);
+        let contents = read_file(&canonical, gzip);
         match contents {
             Ok(res) => Ok(res),
             Err(Error::Hyper(e)) => Err(e),
@@ -55,20 +56,36 @@ impl ServeStatic {
     }
 }
 
-fn read_file(canonical: &Path) -> Result<Response, Error> {
+const MIN_GZIP_SIZE: u64 = 1024;
+
+fn read_file(canonical: &Path, accept_gzip: bool) -> Result<Response, Error> {
     println!("==> [DEBUG] {:?}", canonical);
     let file = File::open(canonical)?;
     let len = file.metadata()?.len();
 
     let mut file = BufReader::new(file);
     let mut body = Vec::with_capacity(len as usize);
-    file.read_to_end(&mut body)?;
+
+    let gzip = accept_gzip && len > MIN_GZIP_SIZE;
+
+    if gzip {
+        use flate2::Compression;
+        use flate2::bufread::GzEncoder;
+
+        let mut gz = GzEncoder::new(file, Compression::Fast);
+        gz.read_to_end(&mut body)?;
+    } else {
+        file.read_to_end(&mut body)?;
+    }
 
     let mut resp = Response::new()
         .with_body(body)
         .with_header(ContentLength(len));
     if let Some(c) = content_type(canonical) {
         resp = resp.with_header(c);
+    }
+    if gzip {
+        resp = resp.with_header(ContentEncoding(vec![Encoding::Gzip]));
     }
 
     Ok(resp)
@@ -106,7 +123,12 @@ impl Service for ServeStatic {
         let path = req.path();
         // Strip the leading '/' since PathBuf will overwrite
         let path = Path::new(&path[1..]);
-        let result = self.read_and_respond(path);
+        let gzip = req.headers()
+            .get::<AcceptEncoding>()
+            .map(|es| es.iter().any(|q| q.item == Encoding::Gzip))
+            .unwrap_or(false);
+
+        let result = self.read_and_respond(path, gzip);
         if let Ok(ref res) = result {
             let code = res.status().as_u16();
             println!("[{}] {} {}", code, req.method(), req.path());
