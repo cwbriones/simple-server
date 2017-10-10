@@ -149,7 +149,7 @@ impl Params {
 
         let root = args.next()
             .map(PathBuf::from)
-            .unwrap_or(".".into());
+            .unwrap_or("./public".into());
 
         let port = args.next()
             .and_then(|p| p.parse::<u16>().ok())
