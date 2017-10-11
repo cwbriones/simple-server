@@ -1,20 +1,20 @@
-extern crate hyper;
+extern crate flate2;
 extern crate futures;
 extern crate futures_cpupool;
+extern crate hyper;
 extern crate mime;
-extern crate flate2;
 
-use futures::{Future, Poll, Async};
+use futures::{Async, Future, Poll};
 use futures_cpupool::Builder as PoolBuilder;
-use futures_cpupool::{CpuPool, CpuFuture};
-use hyper::{Request, Response, Method, StatusCode};
+use futures_cpupool::{CpuFuture, CpuPool};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper::server::Http;
 use hyper::server::Service;
-use hyper::header::{ContentType, ContentLength, ContentEncoding, Encoding, AcceptEncoding};
+use hyper::header::{AcceptEncoding, ContentEncoding, ContentLength, ContentType, Encoding};
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::io::{Read, BufReader};
+use std::io::{BufReader, Read};
 
 use error::Error;
 use std::env;
@@ -123,7 +123,9 @@ impl Future for ResponseFuture {
                 return Ok(Async::Ready(res));
             }
         };
-        inner.poll().or_else(|e| translate_error(e).map(Async::Ready))
+        inner
+            .poll()
+            .or_else(|e| translate_error(e).map(Async::Ready))
     }
 }
 
@@ -178,18 +180,12 @@ impl Params {
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(8080);
 
-        Params {
-            root,
-            port,
-        }
+        Params { root, port }
     }
 }
 
 fn main() {
-    let Params {
-        root,
-        port,
-    } = Params::parse();
+    let Params { root, port } = Params::parse();
     println!("serving {:?} on port {}", &root, port);
 
     let pool = PoolBuilder::new()
@@ -202,7 +198,9 @@ fn main() {
         root: root,
         pool: pool,
     };
-    let server = Http::new().bind(&addr, move || Ok(service.clone())).unwrap();
+    let server = Http::new()
+        .bind(&addr, move || Ok(service.clone()))
+        .unwrap();
 
     server.run().unwrap();
 }

@@ -33,7 +33,7 @@ impl From<::hyper::Error> for Error {
 
 impl From<::std::io::Error> for Error {
     fn from(error: ::std::io::Error) -> Error {
-        use ::std::io::ErrorKind;
+        use std::io::ErrorKind;
 
         if error.kind() == ErrorKind::NotFound {
             return Error::FileNotFound;
@@ -53,4 +53,3 @@ impl From<String> for Error {
         Error::Msg(s)
     }
 }
-
