@@ -36,7 +36,7 @@ impl StaticServer {
         if canonical.extension().is_none() {
             canonical.set_extension("html");
         }
-        ResponseFuture::Found(self.pool.spawn_fn(move || read_file(canonical, gzip)))
+        ResponseFuture::Found(self.pool.spawn_fn(move || read_file(&canonical, gzip)))
     }
 
     fn canonicalize(&self, path: &Path) -> PathBuf {
@@ -55,9 +55,9 @@ impl StaticServer {
 
 const MIN_GZIP_SIZE: u64 = 1024;
 
-fn read_file(canonical: PathBuf, accept_gzip: bool) -> Result<Response, Error> {
+fn read_file(canonical: &Path, accept_gzip: bool) -> Result<Response, Error> {
     // println!("==> [DEBUG] {:?}", canonical);
-    let file = File::open(&canonical)?;
+    let file = File::open(canonical)?;
     let len = file.metadata()?.len();
 
     let mut file = BufReader::new(file);
@@ -78,7 +78,7 @@ fn read_file(canonical: PathBuf, accept_gzip: bool) -> Result<Response, Error> {
     let mut resp = Response::new()
         .with_body(body)
         .with_header(ContentLength(len));
-    if let Some(c) = content_type(&canonical) {
+    if let Some(c) = content_type(canonical) {
         resp = resp.with_header(c);
     }
     if gzip {
@@ -102,7 +102,7 @@ fn content_type(path: &Path) -> Option<ContentType> {
         "json" => Some(ContentType::json()),
         "gif" => "image/gif".parse().ok().map(ContentType),
         "css" => "text/css".parse().ok().map(ContentType),
-        _ => ext.parse().ok().map(|m| ContentType(m)),
+        _ => ext.parse().ok().map(ContentType),
     }
 }
 
@@ -172,7 +172,7 @@ impl Params {
 
         let root = args.next()
             .map(PathBuf::from)
-            .unwrap_or("./public".into());
+            .unwrap_or_else(|| "./public".into());
 
         let port = args.next()
             .and_then(|p| p.parse::<u16>().ok())
@@ -186,17 +186,20 @@ impl Params {
 }
 
 fn main() {
-    let params = Params::parse();
-    println!("serving {:?} on port {}", &params.root, params.port);
+    let Params {
+        root,
+        port,
+    } = Params::parse();
+    println!("serving {:?} on port {}", &root, port);
 
     let pool = PoolBuilder::new()
         .pool_size(4)
         .name_prefix("fs-thread")
         .create();
 
-    let addr = ([127, 0, 0, 1], params.port).into();
+    let addr = ([127, 0, 0, 1], port).into();
     let service = StaticServer {
-        root: params.root,
+        root: root,
         pool: pool,
     };
     let server = Http::new().bind(&addr, move || Ok(service.clone())).unwrap();
