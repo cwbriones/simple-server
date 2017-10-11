@@ -1,9 +1,12 @@
 extern crate hyper;
 extern crate futures;
+extern crate futures_cpupool;
 extern crate mime;
 extern crate flate2;
 
-use futures::future::{self, FutureResult};
+use futures::{Future, Poll, Async};
+use futures_cpupool::Builder as PoolBuilder;
+use futures_cpupool::{CpuPool, CpuFuture};
 use hyper::{Request, Response, Method, StatusCode};
 use hyper::server::Http;
 use hyper::server::Service;
@@ -19,10 +22,13 @@ use std::env;
 mod error;
 
 #[derive(Clone)]
-struct ServeStatic(PathBuf);
+struct StaticServer {
+    root: PathBuf,
+    pool: CpuPool,
+}
 
-impl ServeStatic {
-    fn read_and_respond(&self, path: &Path, gzip: bool) -> Result<Response, ::hyper::Error> {
+impl StaticServer {
+    fn spawn_read(&self, path: &Path, gzip: bool) -> ResponseFuture {
         let mut canonical = self.canonicalize(path);
         if canonical.is_dir() {
             canonical.push("index.html");
@@ -30,20 +36,11 @@ impl ServeStatic {
         if canonical.extension().is_none() {
             canonical.set_extension("html");
         }
-        let contents = read_file(&canonical, gzip);
-        match contents {
-            Ok(res) => Ok(res),
-            Err(Error::Hyper(e)) => Err(e),
-            Err(Error::FileNotFound) => Ok(Response::new().with_status(StatusCode::NotFound)),
-            Err(ref e) => {
-                println!("[ERROR]: {}", e);
-                Ok(Response::new().with_status(StatusCode::InternalServerError))
-            },
-        }
+        ResponseFuture::Found(self.pool.spawn_fn(move || read_file(canonical, gzip)))
     }
 
     fn canonicalize(&self, path: &Path) -> PathBuf {
-        let mut canonical = PathBuf::from(&self.0);
+        let mut canonical = PathBuf::from(&self.root);
         for component in path.components() {
             let c = component.as_ref();
             if c == ".." {
@@ -58,9 +55,9 @@ impl ServeStatic {
 
 const MIN_GZIP_SIZE: u64 = 1024;
 
-fn read_file(canonical: &Path, accept_gzip: bool) -> Result<Response, Error> {
-    println!("==> [DEBUG] {:?}", canonical);
-    let file = File::open(canonical)?;
+fn read_file(canonical: PathBuf, accept_gzip: bool) -> Result<Response, Error> {
+    // println!("==> [DEBUG] {:?}", canonical);
+    let file = File::open(&canonical)?;
     let len = file.metadata()?.len();
 
     let mut file = BufReader::new(file);
@@ -81,7 +78,7 @@ fn read_file(canonical: &Path, accept_gzip: bool) -> Result<Response, Error> {
     let mut resp = Response::new()
         .with_body(body)
         .with_header(ContentLength(len));
-    if let Some(c) = content_type(canonical) {
+    if let Some(c) = content_type(&canonical) {
         resp = resp.with_header(c);
     }
     if gzip {
@@ -109,16 +106,47 @@ fn content_type(path: &Path) -> Option<ContentType> {
     }
 }
 
-impl Service for ServeStatic {
+enum ResponseFuture {
+    Found(CpuFuture<Response, Error>),
+    NotAllowed,
+}
+
+impl Future for ResponseFuture {
+    type Item = Response;
+    type Error = ::hyper::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let inner = match *self {
+            ResponseFuture::Found(ref mut i) => i,
+            ResponseFuture::NotAllowed => {
+                let res = Response::new().with_status(StatusCode::MethodNotAllowed);
+                return Ok(Async::Ready(res));
+            }
+        };
+        inner.poll().or_else(|e| translate_error(e).map(Async::Ready))
+    }
+}
+
+fn translate_error(err: Error) -> Result<Response, ::hyper::Error> {
+    match err {
+        Error::Hyper(e) => Err(e),
+        Error::FileNotFound => Ok(Response::new().with_status(StatusCode::NotFound)),
+        _ => {
+            // println!("[ERROR]: {}", e);
+            Ok(Response::new().with_status(StatusCode::InternalServerError))
+        }
+    }
+}
+
+impl Service for StaticServer {
     type Request = Request;
     type Response = Response;
     type Error = hyper::Error;
-    type Future = FutureResult<Response, hyper::Error>;
+    type Future = ResponseFuture;
 
     fn call(&self, req: Request) -> Self::Future {
-        if req.method() != &Method::Get {
-            let resp = Response::new().with_status(StatusCode::MethodNotAllowed);
-            return future::result(Ok(resp));
+        if *req.method() != Method::Get {
+            return ResponseFuture::NotAllowed;
         }
         let path = req.path();
         // Strip the leading '/' since PathBuf will overwrite
@@ -128,12 +156,7 @@ impl Service for ServeStatic {
             .map(|es| es.iter().any(|q| q.item == Encoding::Gzip))
             .unwrap_or(false);
 
-        let result = self.read_and_respond(path, gzip);
-        if let Ok(ref res) = result {
-            let code = res.status().as_u16();
-            println!("[{}] {} {}", code, req.method(), req.path());
-        }
-        future::result(result)
+        self.spawn_read(path, gzip)
     }
 }
 
@@ -166,8 +189,16 @@ fn main() {
     let params = Params::parse();
     println!("serving {:?} on port {}", &params.root, params.port);
 
+    let pool = PoolBuilder::new()
+        .pool_size(4)
+        .name_prefix("fs-thread")
+        .create();
+
     let addr = ([127, 0, 0, 1], params.port).into();
-    let service = ServeStatic(params.root);
+    let service = StaticServer {
+        root: params.root,
+        pool: pool,
+    };
     let server = Http::new().bind(&addr, move || Ok(service.clone())).unwrap();
 
     server.run().unwrap();
