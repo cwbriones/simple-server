@@ -4,6 +4,10 @@ extern crate futures_cpupool;
 extern crate hyper;
 extern crate mime;
 
+#[macro_use]
+extern crate log;
+extern crate pretty_env_logger;
+
 use futures::{Async, Future, Poll};
 use futures_cpupool::Builder as PoolBuilder;
 use futures_cpupool::{CpuFuture, CpuPool};
@@ -56,7 +60,7 @@ impl StaticServer {
 const MIN_GZIP_SIZE: u64 = 1024;
 
 fn read_file(canonical: &Path, accept_gzip: bool) -> Result<Response, Error> {
-    // println!("==> [DEBUG] {:?}", canonical);
+    debug!("==> {:?}", canonical);
     let file = File::open(canonical)?;
     let len = file.metadata()?.len();
 
@@ -106,6 +110,29 @@ fn content_type(path: &Path) -> Option<ContentType> {
     }
 }
 
+struct RequestLogger(Request, ResponseFuture);
+
+impl RequestLogger {
+    fn log(&self, response: &Response) {
+        let req = &self.0;
+        let status = response.status().as_u16();
+        debug!("[{}] {} {}", status, req.method(), req.path());
+    }
+}
+
+impl Future for RequestLogger {
+    type Item = Response;
+    type Error = ::hyper::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        let inner = self.1.poll();
+        if let Ok(Async::Ready(ref res)) = inner {
+            self.log(res);
+        }
+        inner
+    }
+}
+
 enum ResponseFuture {
     Found(CpuFuture<Response, Error>),
     NotAllowed,
@@ -133,8 +160,8 @@ fn translate_error(err: Error) -> Result<Response, ::hyper::Error> {
     match err {
         Error::Hyper(e) => Err(e),
         Error::FileNotFound => Ok(Response::new().with_status(StatusCode::NotFound)),
-        _ => {
-            // println!("[ERROR]: {}", e);
+        e => {
+            error!("{}", e);
             Ok(Response::new().with_status(StatusCode::InternalServerError))
         }
     }
@@ -144,21 +171,22 @@ impl Service for StaticServer {
     type Request = Request;
     type Response = Response;
     type Error = hyper::Error;
-    type Future = ResponseFuture;
+    type Future = RequestLogger;
 
     fn call(&self, req: Request) -> Self::Future {
         if *req.method() != Method::Get {
-            return ResponseFuture::NotAllowed;
+            return RequestLogger(req, ResponseFuture::NotAllowed);
         }
-        let path = req.path();
-        // Strip the leading '/' since PathBuf will overwrite
-        let path = Path::new(&path[1..]);
+        let path = {
+            // Strip the leading '/' since PathBuf will overwrite
+            PathBuf::from(&req.path()[1..])
+        };
         let gzip = req.headers()
             .get::<AcceptEncoding>()
             .map(|es| es.iter().any(|q| q.item == Encoding::Gzip))
             .unwrap_or(false);
 
-        self.spawn_read(path, gzip)
+        RequestLogger(req, self.spawn_read(&path, gzip))
     }
 }
 
@@ -185,15 +213,16 @@ impl Params {
 }
 
 fn main() {
+    pretty_env_logger::init().unwrap();
     let Params { root, port } = Params::parse();
-    println!("serving {:?} on port {}", &root, port);
-
     let pool = PoolBuilder::new()
         .pool_size(4)
         .name_prefix("fs-thread")
         .create();
 
     let addr = ([127, 0, 0, 1], port).into();
+    info!("Serving {:?} at http://{}", &root, addr);
+
     let service = StaticServer {
         root: root,
         pool: pool,
